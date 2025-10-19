@@ -44,7 +44,12 @@ def find_dominant(
     """
 
     prob_dist = torch.exp(log_probs)
-    sorted_prob_dist, indices = torch.sort(prob_dist, descending=True, dim=-1)
+    # sorted_prob_dist, indices = torch.sort(prob_dist, descending=True, dim=-1)
+    
+    # Choose a smaller k internally for memory efficiency
+    internal_k = min(1024, prob_dist.size(-1))  # adjust based on memory
+    sorted_prob_dist, indices = torch.topk(prob_dist, k=internal_k, dim=-1, largest=True, sorted=True)
+
     if find_dominant_method == "epsilon-cut":
         assert epsilon is not None
         mask = sorted_prob_dist > epsilon
@@ -93,7 +98,12 @@ def find_dominant(
 
     # Mask out indices beyond the cut-off point with value -1
     indices = torch.where(mask, indices, -1)
-    return indices
+
+    # The indices so far only contains the `internal_k` positions. Now pad to vocab_size
+    full_indices = torch.full_like(prob_dist, -1, dtype=torch.long)
+    full_indices[..., :internal_k] = indices
+
+    return full_indices
 
 
 def calculate_boostedprob(
