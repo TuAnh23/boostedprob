@@ -43,7 +43,7 @@ def find_dominant(
         torch.Tensor: Indices of dominant tokens, shape [batch_size, nr_tokens, vocab_size]. -1 values are used to mask out non-dominant tokens.
     """
 
-    prob_dist = torch.exp(log_probs)
+    prob_dist = log_probs.exp_()
     # sorted_prob_dist, indices = torch.sort(prob_dist, descending=True, dim=-1)
     
     # Choose a smaller k internally for memory efficiency
@@ -56,8 +56,8 @@ def find_dominant(
     elif find_dominant_method == "eta-cut":
         assert epsilon is not None
         epsilon = torch.tensor(epsilon)
-        entropy = -torch.mul(log_probs, torch.exp(log_probs)).sum(dim=-1)
-        entropy = entropy.unsqueeze(-1).expand_as(log_probs)
+        entropy = -torch.mul(torch.log(prob_dist), prob_dist).sum(dim=-1)
+        entropy = entropy.unsqueeze(-1).expand_as(prob_dist)
         mask = (sorted_prob_dist > epsilon) | (sorted_prob_dist > torch.sqrt(epsilon) * torch.exp(-entropy))
     elif find_dominant_method == "top-k":
         assert k is not None
@@ -99,11 +99,14 @@ def find_dominant(
     # Mask out indices beyond the cut-off point with value -1
     indices = torch.where(mask, indices, -1)
 
-    # The indices so far only contains the `internal_k` positions. Now pad to vocab_size
-    full_indices = torch.full_like(prob_dist, -1, dtype=torch.long)
-    full_indices[..., :internal_k] = indices
+    # Return prob to log prob inplace to avoid downstream error
+    log_probs = prob_dist.log_()
 
-    return full_indices
+    # The indices so far only contains the `internal_k` positions. Now pad to vocab_size
+    # full_indices = torch.full_like(prob_dist, -1, dtype=torch.long)
+    # full_indices[..., :internal_k] = indices
+
+    return indices
 
 
 def calculate_boostedprob(
