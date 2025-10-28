@@ -29,7 +29,7 @@ print(boostedprob.find_dominant(log_probs))
 # -1 are dummy values to be ignored.
 
 # Calculate boosted prob (find_dominant() runs internally)
-result = boostedprob.calculate_boostedprob(log_probs, target)   # shape [nr_tokens, 1]
+print(boostedprob.calculate_boostedprob(log_probs, target))   # shape [nr_tokens, 1]
 # Output
 # tensor([0.0500, 0.9000])
 ```
