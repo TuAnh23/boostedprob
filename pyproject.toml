@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "boostedprob"
-version = "0.1.1"
+version = "0.1.2"
 description = "Utilities to identify dominant tokens and compute boosted model probabilities for Quality Estimation."
 readme = "README.md"
 requires-python = ">=3.9"

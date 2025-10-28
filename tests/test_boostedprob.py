@@ -14,3 +14,6 @@ def test_calculate_boostedprob_example():
 
     expected = torch.tensor([0.0500, 0.9000])
     torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+if __name__ == "__main__":
+    test_calculate_boostedprob_example()
