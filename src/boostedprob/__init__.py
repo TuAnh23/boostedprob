@@ -119,6 +119,7 @@ def calculate_boostedprob(
         p_jump: Optional[float] = 0.3, 
         minp: Optional[float] = 0.9,
         topp: Optional[float] = 0.9,
+        gamma: Optional[float] = 0.01,
     ):
     """
     Calculate boosted probabilities based on dominant tokens.
@@ -141,6 +142,7 @@ def calculate_boostedprob(
         p_jump (float, optional): Jump threshold for "difference_jump" method.
         minp (float, optional): Minimum probability fraction for "min-p" method.
         topp (float, optional): Cumulative probability threshold for "top-p" method.
+        gamma (float, optional): Power parameter for "weighted_sum_dominant_mass" method (close to 0).
     Returns:
         torch.Tensor: Boosted probabilities or binary indicators, shape [batch_size, nr_tokens].
     """
@@ -171,9 +173,31 @@ def calculate_boostedprob(
         else:
             dominant_binary[dominant_indices[dominant_indices != -1]] = 1
 
-        dominant_mass = (dominant_binary * trans_probs).sum(dim=-1)
+        dominant_cluster_mass = (dominant_binary * trans_probs).sum(dim=-1)
         selected_prob = trans_probs.gather(dim=-1, index=target.unsqueeze(-1)).squeeze(-1)
-        sum_dominant_mass = torch.where(is_dominant, dominant_mass, selected_prob)
-        return sum_dominant_mass
+        final = torch.where(is_dominant, dominant_cluster_mass, selected_prob)
+        return final
+    elif ue_method == "weighted_sum_dominant_mass":
+        # For dominant tokens: score = dominant_cluster_mass x self_prob ** 0.01
+        # The goal is to keep the ranking within the dominant cluster, while still boost everyone's confidence
+        trans_probs = torch.exp(log_probs)
+        dominant_binary = torch.zeros_like(trans_probs, dtype=torch.uint8)
+
+        lists = [list(range(x)) for x in trans_probs.shape[:-1]]
+        if len(lists) > 0:
+            combs = tuple(itertools.product(*lists))
+            for comb in combs:
+                dominant_binary[comb][dominant_indices[comb][dominant_indices[comb] != -1]] = 1
+        else:
+            dominant_binary[dominant_indices[dominant_indices != -1]] = 1
+
+        dominant_cluster_mass = (dominant_binary * trans_probs).sum(dim=-1)
+        selected_prob = trans_probs.gather(dim=-1, index=target.unsqueeze(-1)).squeeze(-1)
+        
+        # Calculate the weight to preserve in-cluster ranking, but still keep the high total-dominant magnitude        
+        boosted_score = dominant_cluster_mass * torch.pow(selected_prob, gamma)
+        
+        final = torch.where(is_dominant, boosted_score, selected_prob)
+        return final
     else:
         raise RuntimeError(f"Unknown ue_method {ue_method}")
