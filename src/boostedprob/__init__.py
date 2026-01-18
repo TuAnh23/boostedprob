@@ -20,6 +20,7 @@ def find_dominant(
     p_jump: Optional[float] = 0.3, 
     minp: Optional[float] = 0.9,
     topp: Optional[float] = 0.9,
+    cut_point_mode: str = "last",
 ) -> torch.Tensor:
     """
     Find dominant tokens based on various methods.
@@ -39,6 +40,7 @@ def find_dominant(
         p_jump (float, optional): Jump threshold for "difference_jump" method.
         minp (float, optional): Minimum probability fraction for "min-p" method.
         topp (float, optional): Cumulative probability threshold for "top-p" method.
+        cut_point_mode (str): Mode for determining cut point. Options: "first" or "last". Default is "last".
     Returns:
         torch.Tensor: Indices of dominant tokens, shape [batch_size, nr_tokens, vocab_size]. -1 values are used to mask out non-dominant tokens.
     """
@@ -78,9 +80,16 @@ def find_dominant(
     else:
         raise RuntimeError(f"Unknown find_dominant_method {find_dominant_method}")
 
-    # Get the last occurrence of True along the last axis
-    cut_points = mask.shape[-1] - 1 - torch.argmax(torch.flip(mask, dims=[-1]).int(),
-                                                   dim=-1)  # Shape: [batch_size, nr_tokens]
+    # Get the occurrence of True along the last axis based on cut_point_mode
+    if cut_point_mode == "last":
+        # Get the last occurrence of True along the last axis
+        cut_points = mask.shape[-1] - 1 - torch.argmax(torch.flip(mask, dims=[-1]).int(),
+                                                       dim=-1)  # Shape: [batch_size, nr_tokens]
+    elif cut_point_mode == "first":
+        # Get the first occurrence of True along the last axis
+        cut_points = torch.argmax(mask.int(), dim=-1)  # Shape: [batch_size, nr_tokens]
+    else:
+        raise RuntimeError(f"Unknown cut_point_mode {cut_point_mode}")
 
     # Handle cases where no cutoff is found (all False)
     no_cutoff = ~mask.any(axis=-1)
@@ -111,7 +120,7 @@ def find_dominant(
 
 def calculate_boostedprob(
         log_probs: torch.Tensor, 
-        target: torch.Tensor,
+        target: Optional[torch.Tensor] = None,
         ue_method: str = "sum_dominant_mass",
         find_dominant_method: str = "difference_jump", 
         epsilon: Optional[float] = 0.005,
@@ -120,13 +129,15 @@ def calculate_boostedprob(
         minp: Optional[float] = 0.9,
         topp: Optional[float] = 0.9,
         gamma: Optional[float] = 0.01,
+        cut_point_mode: str = "last",
     ):
     """
     Calculate boosted probabilities based on dominant tokens.
     Args:
         log_probs (torch.Tensor): Model log probabilities (output of final softmax) 
             of shape [batch_size, nr_tokens, vocab_size].
-        target (torch.Tensor): Indices finally output tokens of shape [batch_size, nr_tokens].
+        target (torch.Tensor, optional): Indices of finally output tokens of shape [batch_size, nr_tokens]. 
+            If None, returns boosted probabilities for all tokens in the vocabulary.
         ue_method (str): Uncertainty estimation method. Options include:
             - "is_dominant": Returns 1 if the predicted token is dominant, else 0.
             - "sum_dominant_mass": Returns the sum of probabilities of dominant tokens, or the predicted token's probability if it's not dominant.
@@ -143,8 +154,11 @@ def calculate_boostedprob(
         minp (float, optional): Minimum probability fraction for "min-p" method.
         topp (float, optional): Cumulative probability threshold for "top-p" method.
         gamma (float, optional): Power parameter for "weighted_sum_dominant_mass" method (close to 0).
+        cut_point_mode (str): Mode for determining cut point. Options: "first" or "last". Default is "last".
     Returns:
-        torch.Tensor: Boosted probabilities or binary indicators, shape [batch_size, nr_tokens].
+        torch.Tensor: Boosted probabilities or binary indicators. 
+            If target is provided: shape [batch_size, nr_tokens].
+            If target is None: shape [batch_size, nr_tokens, vocab_size].
     """
     dominant_indices = find_dominant(
         log_probs=log_probs,
@@ -153,51 +167,80 @@ def calculate_boostedprob(
         k=k,
         p_jump=p_jump,
         minp=minp, 
-        topp=topp, 
+        topp=topp,
+        cut_point_mode=cut_point_mode,
     )  # Shape: [batch_size, nr_tokens, vocab_size]
 
-    # Check if each predicted_id is in the corresponding dominant indices
-    is_dominant = (target.unsqueeze(-1) == dominant_indices).any(dim=-1)  # Shape: [batch_size, nr_tokens]
-
-    if ue_method == "is_dominant":
-        return is_dominant.int()  # Convert to 0/1 format
-    elif ue_method == "sum_dominant_mass":
+    if target is None:
+        # Return boosted probabilities for all tokens
         trans_probs = torch.exp(log_probs)
-        dominant_binary = torch.zeros_like(trans_probs, dtype=torch.uint8)  # Initialize binary tensor
+        dominant_binary = torch.zeros_like(trans_probs, dtype=torch.bool)
 
         lists = [list(range(x)) for x in trans_probs.shape[:-1]]
         if len(lists) > 0:
             combs = tuple(itertools.product(*lists))
             for comb in combs:
-                dominant_binary[comb][dominant_indices[comb][dominant_indices[comb] != -1]] = 1
+                dominant_binary[comb][dominant_indices[comb][dominant_indices[comb] != -1]] = True
         else:
-            dominant_binary[dominant_indices[dominant_indices != -1]] = 1
+            dominant_binary[dominant_indices[dominant_indices != -1]] = True
 
-        dominant_cluster_mass = (dominant_binary * trans_probs).sum(dim=-1)
-        selected_prob = trans_probs.gather(dim=-1, index=target.unsqueeze(-1)).squeeze(-1)
-        final = torch.where(is_dominant, dominant_cluster_mass, selected_prob)
-        return final
-    elif ue_method == "weighted_sum_dominant_mass":
-        # For dominant tokens: score = dominant_cluster_mass x self_prob ** 0.01
-        # The goal is to keep the ranking within the dominant cluster, while still boost everyone's confidence
-        trans_probs = torch.exp(log_probs)
-        dominant_binary = torch.zeros_like(trans_probs, dtype=torch.uint8)
+        dominant_cluster_mass = (dominant_binary * trans_probs).sum(dim=-1, keepdim=True)  # [batch_size, nr_tokens, 1]
 
-        lists = [list(range(x)) for x in trans_probs.shape[:-1]]
-        if len(lists) > 0:
-            combs = tuple(itertools.product(*lists))
-            for comb in combs:
-                dominant_binary[comb][dominant_indices[comb][dominant_indices[comb] != -1]] = 1
+        if ue_method == "is_dominant":
+            return dominant_binary.int()  # [batch_size, nr_tokens, vocab_size]
+        elif ue_method == "sum_dominant_mass":
+            final = torch.where(dominant_binary, dominant_cluster_mass, trans_probs)
+            return final  # [batch_size, nr_tokens, vocab_size]
+        elif ue_method == "weighted_sum_dominant_mass":
+            boosted_score = dominant_cluster_mass * torch.pow(trans_probs, gamma)
+            final = torch.where(dominant_binary, boosted_score, trans_probs)
+            return final  # [batch_size, nr_tokens, vocab_size]
         else:
-            dominant_binary[dominant_indices[dominant_indices != -1]] = 1
-
-        dominant_cluster_mass = (dominant_binary * trans_probs).sum(dim=-1)
-        selected_prob = trans_probs.gather(dim=-1, index=target.unsqueeze(-1)).squeeze(-1)
-        
-        # Calculate the weight to preserve in-cluster ranking, but still keep the high total-dominant magnitude        
-        boosted_score = dominant_cluster_mass * torch.pow(selected_prob, gamma)
-        
-        final = torch.where(is_dominant, boosted_score, selected_prob)
-        return final
+            raise RuntimeError(f"Unknown ue_method {ue_method}")
     else:
-        raise RuntimeError(f"Unknown ue_method {ue_method}")
+        # Return boosted probabilities for target tokens
+        # Check if each predicted_id is in the corresponding dominant indices
+        is_dominant = (target.unsqueeze(-1) == dominant_indices).any(dim=-1)  # Shape: [batch_size, nr_tokens]
+
+        if ue_method == "is_dominant":
+            return is_dominant.int()  # Convert to 0/1 format
+        elif ue_method == "sum_dominant_mass":
+            trans_probs = torch.exp(log_probs)
+            dominant_binary = torch.zeros_like(trans_probs, dtype=torch.bool)  # Initialize binary tensor
+
+            lists = [list(range(x)) for x in trans_probs.shape[:-1]]
+            if len(lists) > 0:
+                combs = tuple(itertools.product(*lists))
+                for comb in combs:
+                    dominant_binary[comb][dominant_indices[comb][dominant_indices[comb] != -1]] = True
+            else:
+                dominant_binary[dominant_indices[dominant_indices != -1]] = True
+
+            dominant_cluster_mass = (dominant_binary * trans_probs).sum(dim=-1)
+            selected_prob = trans_probs.gather(dim=-1, index=target.unsqueeze(-1)).squeeze(-1)
+            final = torch.where(is_dominant, dominant_cluster_mass, selected_prob)
+            return final
+        elif ue_method == "weighted_sum_dominant_mass":
+            # For dominant tokens: score = dominant_cluster_mass x self_prob ** 0.01
+            # The goal is to keep the ranking within the dominant cluster, while still boost everyone's confidence
+            trans_probs = torch.exp(log_probs)
+            dominant_binary = torch.zeros_like(trans_probs, dtype=torch.bool)
+
+            lists = [list(range(x)) for x in trans_probs.shape[:-1]]
+            if len(lists) > 0:
+                combs = tuple(itertools.product(*lists))
+                for comb in combs:
+                    dominant_binary[comb][dominant_indices[comb][dominant_indices[comb] != -1]] = True
+            else:
+                dominant_binary[dominant_indices[dominant_indices != -1]] = True
+
+            dominant_cluster_mass = (dominant_binary * trans_probs).sum(dim=-1)
+            selected_prob = trans_probs.gather(dim=-1, index=target.unsqueeze(-1)).squeeze(-1)
+            
+            # Calculate the weight to preserve in-cluster ranking, but still keep the high total-dominant magnitude        
+            boosted_score = dominant_cluster_mass * torch.pow(selected_prob, gamma)
+            
+            final = torch.where(is_dominant, boosted_score, selected_prob)
+            return final
+        else:
+            raise RuntimeError(f"Unknown ue_method {ue_method}")
